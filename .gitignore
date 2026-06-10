@@ -6,6 +6,10 @@ __pycache__/
 # C extensions
 *.so
 
+chat_history/*
+my_private_key.bin
+my_public_key.*
+
 # Distribution / packaging
 .Python
 build/
