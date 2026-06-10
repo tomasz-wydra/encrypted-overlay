@@ -7,10 +7,10 @@ __pycache__/
 *.so
 
 # Hushbox secure related
-chat_history/*
+chat_history/
 my_private_key.bin
-my_public_key.*
-contact_keys.json
+my_public_key_qr.*
+contact_keys.*
 
 # Distribution / packaging
 .Python
