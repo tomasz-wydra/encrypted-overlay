@@ -1,103 +1,140 @@
 """
-Hushbox Encrypted Chat - główna aplikacja GUI.
+Hushbox — główna aplikacja GUI.
 
 Układ:
   ┌─────────────────────────────────────────────────────────────┐
+  │  TOPBAR                                                      │
+  ├──────────────────────┬──────────────────────────────────────┤
   │  SIDEBAR (kontakty)  │  NOTEBOOK (zakładki rozmów)          │
   │                      │  ┌──────────────────────────────────┐│
   │  [+ Dodaj kontakt]   │  │  historia czatu (scrollable)     ││
-  │  [kontakt 1]         │  │                                  ││
-  │  [kontakt 2]         │  │                                  ││
-  │  ...                 │  ├──────────────────────────────────┤│
-  │                      │  │  [pole do wpisywania]  [Wyślij]  ││
-  │  ──────────────────  │  └──────────────────────────────────┘│
-  │  [Mój QR]            │                                       │
-  │  [Importuj QR]       │                                       │
-  └─────────────────────────────────────────────────────────────┘
-
-Każde kliknięcie kontaktu otwiera/przełącza zakładkę z historią rozmowy.
-Pole "Wklej zaszyfrowaną" jest widoczne po rozwinięciu panelu "Odbierz".
+  │  [kontakt 1] ⋮       │  │                                  ││
+  │  [kontakt 2] ⋮       │  ├──────────────────────────────────┤│
+  │  ...                 │  │  [▼ Odbierz]  (zwijany panel)    ││
+  │                      │  ├──────────────────────────────────┤│
+  │                      │  │  [input]  [Wyślij 🔒] [Telegram] ││
+  └──────────────────────┴──────────────────────────────────────┘
 """
 
 import json
+import threading
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
 from encryption_manager import EncryptionManager
 from chat_store import ChatStore, Message
+from telegram_transport import TelegramTransport
 
 
 # ─────────────────────────────────────────────────────────────────
 # Stałe wizualne
 # ─────────────────────────────────────────────────────────────────
-FONT_TITLE = ("Segoe UI", 18, "bold")
-FONT_LABEL = ("Segoe UI", 12)
-FONT_MONO  = ("Consolas", 11)
-FONT_SMALL = ("Segoe UI", 10)
+FONT_TITLE  = ("Segoe UI", 18, "bold")
+FONT_LABEL  = ("Segoe UI", 12)
+FONT_MONO   = ("Consolas", 11)
+FONT_SMALL  = ("Segoe UI", 10)
 
-COLOR_SENT  = "#1a6b3c"   # ciemna zieleń - wiadomości wychodzące
-COLOR_RECV  = "#1a3a6b"   # ciemny niebieski - wiadomości przychodzące
-COLOR_CIPHER = "#555555"  # szary - tekst zaszyfrowany
+COLOR_SENT   = "#1a6b3c"
+COLOR_RECV   = "#4fa3e3"
+COLOR_CIPHER = "#555555"
+COLOR_TG     = "#2196a8"   # akcent dla Telegram
 
 DATA_DIR = "."
 
 
 # ─────────────────────────────────────────────────────────────────
-# Okno dodawania / edycji kontaktu
+# Dialog dodawania / edycji kontaktu
 # ─────────────────────────────────────────────────────────────────
 class ContactDialog(ctk.CTkToplevel):
-    """Modal do dodawania / edytowania kontaktu."""
+    """Modal do dodawania / edytowania kontaktu (klucz + dane Telegram)."""
 
-    def __init__(self, parent, title: str, name: str = "", key: str = ""):
+    def __init__(self, parent, title: str,
+                 name: str = "", key: str = "",
+                 tg_token: str = "", tg_chat_id: str = ""):
         super().__init__(parent)
         self.title(title)
-        self.geometry("520x320")
+        self.geometry("560x480")
         self.resizable(False, False)
         self.grab_set()
-        self.result: tuple[str, str] | None = None
+        self.result: tuple | None = None   # (name, key, tg_token, tg_chat_id)
 
-        ctk.CTkLabel(self, text="Nazwa kontaktu:", font=FONT_LABEL).pack(anchor="w", padx=20, pady=(20, 2))
-        self.name_entry = ctk.CTkEntry(self, width=480, placeholder_text="np. Jan Kowalski")
+        # ── Nazwa ──
+        ctk.CTkLabel(self, text="Contact name:", font=FONT_LABEL).pack(anchor="w", padx=20, pady=(20, 2))
+        self.name_entry = ctk.CTkEntry(self, width=520, placeholder_text="e.g. Jan Kowalski")
         self.name_entry.pack(padx=20)
         if name:
             self.name_entry.insert(0, name)
 
-        ctk.CTkLabel(self, text="Klucz publiczny (base64):", font=FONT_LABEL).pack(anchor="w", padx=20, pady=(14, 2))
-        self.key_entry = ctk.CTkEntry(self, width=480, placeholder_text="Wklej klucz base64 lub skan z QR...")
+        # ── Klucz publiczny ──
+        ctk.CTkLabel(self, text="Public key (base64):", font=FONT_LABEL).pack(anchor="w", padx=20, pady=(14, 2))
+        self.key_entry = ctk.CTkEntry(self, width=520, placeholder_text="Paste base64 key or scan QR...")
         self.key_entry.pack(padx=20)
         if key:
             self.key_entry.insert(0, key)
 
+        # ── Separator Telegram ──
+        sep_frame = ctk.CTkFrame(self, fg_color="transparent")
+        sep_frame.pack(fill="x", padx=20, pady=(18, 4))
+        ctk.CTkLabel(sep_frame, text="── Telegram (optional) ──",
+                     font=FONT_SMALL, text_color="#888").pack()
+
+        # ── Bot token ──
+        ctk.CTkLabel(self, text="Your Bot Token (from BotFather):", font=FONT_LABEL).pack(anchor="w", padx=20, pady=(4, 2))
+        self.token_entry = ctk.CTkEntry(self, width=520,
+                                         placeholder_text="123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ  (dummy for now)")
+        self.token_entry.pack(padx=20)
+        if tg_token:
+            self.token_entry.insert(0, tg_token)
+
+        # ── Chat ID odbiorcy ──
+        chat_id_row = ctk.CTkFrame(self, fg_color="transparent")
+        chat_id_row.pack(fill="x", padx=20, pady=(10, 2))
+        ctk.CTkLabel(chat_id_row, text="Recipient's Telegram Chat ID:", font=FONT_LABEL).pack(side="left")
+        ctk.CTkLabel(chat_id_row, text=" (?)", font=FONT_SMALL,
+                     text_color="#888",
+                     cursor="hand2").pack(side="left")
+
+        self.chat_id_entry = ctk.CTkEntry(self, width=520,
+                                           placeholder_text="e.g. 123456789  — ask contact to send /start to your bot")
+        self.chat_id_entry.pack(padx=20)
+        if tg_chat_id:
+            self.chat_id_entry.insert(0, tg_chat_id)
+
+        # ── Przyciski ──
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(pady=20)
-        ctk.CTkButton(btn_frame, text="Zapisz", width=120, command=self._save).pack(side="left", padx=10)
-        ctk.CTkButton(btn_frame, text="Anuluj", width=120, fg_color="#555", command=self.destroy).pack(side="left", padx=10)
+        ctk.CTkButton(btn_frame, text="Save", width=120, command=self._save).pack(side="left", padx=10)
+        ctk.CTkButton(btn_frame, text="Cancel", width=120,
+                      fg_color="#555", command=self.destroy).pack(side="left", padx=10)
 
         self.name_entry.focus()
 
     def _save(self):
-        name = self.name_entry.get().strip()
-        key  = self.key_entry.get().strip()
+        name      = self.name_entry.get().strip()
+        key       = self.key_entry.get().strip()
+        tg_token  = self.token_entry.get().strip()
+        tg_chat   = self.chat_id_entry.get().strip()
+
         if not name:
-            messagebox.showerror("Błąd", "Nazwa kontaktu jest wymagana.", parent=self)
+            messagebox.showerror("Error", "Contact name is required.", parent=self)
             return
         if not key:
-            messagebox.showerror("Błąd", "Klucz publiczny jest wymagany.", parent=self)
+            messagebox.showerror("Error", "Public key is required.", parent=self)
             return
-        self.result = (name, key)
+        self.result = (name, key, tg_token, tg_chat)
         self.destroy()
 
 
 # ─────────────────────────────────────────────────────────────────
-# Panel QR
+# Okno QR
 # ─────────────────────────────────────────────────────────────────
 class QRWindow(ctk.CTkToplevel):
     def __init__(self, parent, public_key_b64: str):
         super().__init__(parent)
-        self.title("Mój klucz publiczny – QR")
-        self.geometry("520x560")
+        self.title("My Public Key — QR")
+        self.geometry("520x580")
         self.resizable(False, False)
 
         try:
@@ -107,7 +144,8 @@ class QRWindow(ctk.CTkToplevel):
             qr_path = "my_public_key_qr.png"
             qr.save(qr_path, scale=6, border=2)
 
-            ctk.CTkLabel(self, text="Pokaż ten QR kontaktowi, by dodał Cię do listy.", font=FONT_SMALL).pack(pady=(16, 4))
+            ctk.CTkLabel(self, text="Show this QR to a contact so they can add you.",
+                         font=FONT_SMALL).pack(pady=(16, 4))
 
             img = Image.open(qr_path).resize((320, 320))
             photo = ImageTk.PhotoImage(img)
@@ -120,21 +158,21 @@ class QRWindow(ctk.CTkToplevel):
             key_box.configure(state="disabled")
             key_box.pack(pady=10, padx=20)
 
-            ctk.CTkButton(self, text="Kopiuj klucz", command=lambda: self._copy(public_key_b64)).pack(pady=4)
-
+            ctk.CTkButton(self, text="Copy key",
+                          command=lambda: self._copy(public_key_b64)).pack(pady=4)
         except Exception as e:
-            ctk.CTkLabel(self, text=f"Błąd generowania QR:\n{e}", wraplength=480).pack(pady=30)
+            ctk.CTkLabel(self, text=f"QR generation error:\n{e}", wraplength=480).pack(pady=30)
 
-        ctk.CTkButton(self, text="Zamknij", fg_color="#555", command=self.destroy).pack(pady=10)
+        ctk.CTkButton(self, text="Close", fg_color="#555", command=self.destroy).pack(pady=10)
 
     def _copy(self, text: str):
         self.clipboard_clear()
         self.clipboard_append(text)
-        messagebox.showinfo("Skopiowano", "Klucz publiczny skopiowany do schowka.", parent=self)
+        messagebox.showinfo("Copied", "Public key copied to clipboard.", parent=self)
 
 
 # ─────────────────────────────────────────────────────────────────
-# Panel "Odbierz wiadomość" (wklej zaszyfrowany tekst)
+# Panel "Odbierz wiadomość"
 # ─────────────────────────────────────────────────────────────────
 class ReceivePanel(ctk.CTkFrame):
     def __init__(self, parent, on_decrypt_cb):
@@ -143,8 +181,8 @@ class ReceivePanel(ctk.CTkFrame):
 
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x")
-        ctk.CTkLabel(header, text="📥 Odbierz zaszyfrowaną wiadomość", font=FONT_LABEL).pack(side="left", padx=6)
-        self._toggle_btn = ctk.CTkButton(header, text="▼ rozwiń", width=90,
+        ctk.CTkLabel(header, text="📥 Receive encrypted message", font=FONT_LABEL).pack(side="left", padx=6)
+        self._toggle_btn = ctk.CTkButton(header, text="▲ expand", width=90,
                                           fg_color="#444", command=self._toggle)
         self._toggle_btn.pack(side="right", padx=6)
 
@@ -154,20 +192,22 @@ class ReceivePanel(ctk.CTkFrame):
         inner = ctk.CTkFrame(self._body, fg_color="transparent")
         inner.pack(fill="x", padx=6, pady=4)
 
-        self.cipher_entry = ctk.CTkEntry(inner, placeholder_text="Wklej zaszyfrowany tekst base64...", font=FONT_MONO)
+        self.cipher_entry = ctk.CTkEntry(inner,
+                                          placeholder_text="Paste base64 ciphertext here...",
+                                          font=FONT_MONO)
         self.cipher_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.cipher_entry.bind("<Return>", lambda _: self._on_decrypt(self.cipher_entry.get()))
 
-        ctk.CTkButton(inner, text="Deszyfruj", width=90,
+        ctk.CTkButton(inner, text="Decrypt", width=90,
                       command=lambda: self._on_decrypt(self.cipher_entry.get())).pack(side="right")
 
     def _toggle(self):
         if self._body_visible:
             self._body.pack_forget()
-            self._toggle_btn.configure(text="▼ rozwiń")
+            self._toggle_btn.configure(text="▲ expand")
         else:
             self._body.pack(fill="x")
-            self._toggle_btn.configure(text="▲ zwiń")
+            self._toggle_btn.configure(text="▼ collapse")
             self.cipher_entry.focus()
         self._body_visible = not self._body_visible
 
@@ -180,70 +220,88 @@ class ReceivePanel(ctk.CTkFrame):
 # ─────────────────────────────────────────────────────────────────
 class ChatTab(ctk.CTkFrame):
     def __init__(self, parent, contact_name: str,
-                 enc_manager: EncryptionManager, chat_store: ChatStore):
+                 enc_manager: EncryptionManager,
+                 chat_store: ChatStore,
+                 tg_transport: "TelegramTransport | None"):
         super().__init__(parent, fg_color="transparent")
         self.contact_name = contact_name
         self._enc = enc_manager
         self._store = chat_store
+        self._tg = tg_transport
         self._build_ui()
         self._load_history()
 
     def _build_ui(self):
-        # ── Historia czatu ──
+        # ── Historia ──
         self.history = ctk.CTkTextbox(self, font=FONT_LABEL, state="disabled", wrap="word")
         self.history.pack(fill="both", expand=True, padx=8, pady=(8, 0))
 
-        # tagi kolorystyczne
-        self.history._textbox.tag_configure("sent_label",   foreground=COLOR_SENT,   font=(FONT_LABEL[0], FONT_LABEL[1], "bold"))
-        self.history._textbox.tag_configure("sent_text",    foreground=COLOR_SENT)
-        self.history._textbox.tag_configure("recv_label",   foreground="#4fa3e3",     font=(FONT_LABEL[0], FONT_LABEL[1], "bold"))
-        self.history._textbox.tag_configure("recv_text",    foreground="#4fa3e3")
-        self.history._textbox.tag_configure("cipher_text",  foreground=COLOR_CIPHER,  font=(FONT_MONO[0], 9))
-        self.history._textbox.tag_configure("timestamp",    foreground="#888888",     font=(FONT_SMALL[0], 9))
-        self.history._textbox.tag_configure("separator",    foreground="#444444")
+        tb = self.history._textbox
+        tb.tag_configure("sent_label",  foreground=COLOR_SENT,  font=(FONT_LABEL[0], FONT_LABEL[1], "bold"))
+        tb.tag_configure("sent_text",   foreground=COLOR_SENT)
+        tb.tag_configure("recv_label",  foreground=COLOR_RECV,  font=(FONT_LABEL[0], FONT_LABEL[1], "bold"))
+        tb.tag_configure("recv_text",   foreground=COLOR_RECV)
+        tb.tag_configure("cipher_text", foreground=COLOR_CIPHER, font=(FONT_MONO[0], 9))
+        tb.tag_configure("timestamp",   foreground="#888888",    font=(FONT_SMALL[0], 9))
+        tb.tag_configure("tg_badge",    foreground=COLOR_TG,     font=(FONT_SMALL[0], 9))
+        tb.tag_configure("system_msg",  foreground="#cc8800",    font=(FONT_SMALL[0], 10, "italic"))
 
         # ── Panel odbierania ──
         self._receive_panel = ReceivePanel(self, on_decrypt_cb=self._handle_decrypt)
         self._receive_panel.pack(fill="x", padx=8, pady=(4, 0))
 
-        # ── Pole wpisywania + przycisk Wyślij ──
+        # ── Pole wpisywania + przyciski ──
         input_frame = ctk.CTkFrame(self, fg_color="transparent")
         input_frame.pack(fill="x", padx=8, pady=(4, 8))
 
         self.msg_entry = ctk.CTkEntry(
             input_frame,
-            placeholder_text=f"Wiadomość do {self.contact_name}...",
+            placeholder_text=f"Message to {self.contact_name}...",
             font=FONT_LABEL,
         )
         self.msg_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        self.msg_entry.bind("<Return>", lambda _: self._send())
-        self.msg_entry.bind("<Shift-Return>", lambda _: None)   # ignorujemy shift-enter
+        self.msg_entry.bind("<Return>", lambda _: self._send_clipboard())
 
-        self._send_btn = ctk.CTkButton(input_frame, text="Wyślij 🔒", width=110, command=self._send)
-        self._send_btn.pack(side="right")
+        self._send_btn = ctk.CTkButton(
+            input_frame, text="Send 🔒", width=100, command=self._send_clipboard
+        )
+        self._send_btn.pack(side="left", padx=(0, 4))
+
+        self._tg_btn = ctk.CTkButton(
+            input_frame, text="✈ Telegram", width=110,
+            fg_color=COLOR_TG, hover_color="#187a85",
+            command=self._send_telegram,
+        )
+        self._tg_btn.pack(side="left")
+        self._update_tg_button_state()
 
     # ── Ładowanie historii ──────────────────────────────────────
 
     def _load_history(self):
-        msgs = self._store.load(self.contact_name)
-        for msg in msgs:
+        for msg in self._store.load(self.contact_name):
             self._render_message(msg, scroll=False)
         self.history.see("end")
 
-    # ── Renderowanie wiadomości ─────────────────────────────────
+    # ── Renderowanie ────────────────────────────────────────────
 
     def _render_message(self, msg: Message, scroll: bool = True):
         tb = self.history._textbox
         self.history.configure(state="normal")
 
+        via = " [TG]" if getattr(msg, "via_telegram", False) else ""
+
         if msg.direction == "out":
-            tb.insert("end", f"[{msg.timestamp}] ", "timestamp")
-            tb.insert("end", "Ty: ", "sent_label")
+            tb.insert("end", f"[{msg.timestamp}]", "timestamp")
+            if via:
+                tb.insert("end", via, "tg_badge")
+            tb.insert("end", " You: ", "sent_label")
             tb.insert("end", f"{msg.plaintext}\n", "sent_text")
             tb.insert("end", f"  ╰─ {msg.ciphertext}\n", "cipher_text")
         else:
-            tb.insert("end", f"[{msg.timestamp}] ", "timestamp")
-            tb.insert("end", f"{self.contact_name}: ", "recv_label")
+            tb.insert("end", f"[{msg.timestamp}]", "timestamp")
+            if via:
+                tb.insert("end", via, "tg_badge")
+            tb.insert("end", f" {self.contact_name}: ", "recv_label")
             tb.insert("end", f"{msg.plaintext}\n", "recv_text")
 
         tb.insert("end", "\n")
@@ -251,16 +309,22 @@ class ChatTab(ctk.CTkFrame):
         if scroll:
             self.history.see("end")
 
-    # ── Wysyłanie ───────────────────────────────────────────────
+    def _render_system(self, text: str):
+        self.history.configure(state="normal")
+        self.history._textbox.insert("end", f"  ℹ {text}\n\n", "system_msg")
+        self.history.configure(state="disabled")
+        self.history.see("end")
 
-    def _send(self):
+    # ── Wysyłanie — schowek ─────────────────────────────────────
+
+    def _send_clipboard(self):
         text = self.msg_entry.get().strip()
         if not text:
             return
         try:
             cipher = self._enc.encrypt(self.contact_name, text)
         except Exception as e:
-            self._show_error(f"Szyfrowanie nie powiodło się:\n{e}")
+            self._render_system(f"Encryption failed: {e}")
             return
 
         msg = Message(direction="out", plaintext=text, ciphertext=cipher)
@@ -268,41 +332,100 @@ class ChatTab(ctk.CTkFrame):
         self._render_message(msg)
         self.msg_entry.delete(0, "end")
 
-        # Schowek - automatyczne skopiowanie zaszyfrowanego tekstu
         self.clipboard_clear()
         self.clipboard_append(cipher)
-        self._flash_send_btn()
+        self._flash_btn(self._send_btn, "✓ Copied!", "#1a6b3c", "Send 🔒")
 
-    def _flash_send_btn(self):
-        """Chwilowe potwierdzenie wysłania - zmiana koloru przycisku."""
-        self._send_btn.configure(text="✓ Skopiowano!", fg_color="#1a6b3c")
-        self.after(1800, lambda: self._send_btn.configure(text="Wyślij 🔒", fg_color=["#3B8ED0", "#1F6AA5"]))
+    # ── Wysyłanie — Telegram ────────────────────────────────────
+
+    def _send_telegram(self):
+        text = self.msg_entry.get().strip()
+        if not text:
+            return
+
+        contact = self._enc.get_contact(self.contact_name)
+        if not contact.telegram_bot_token or not contact.telegram_chat_id:
+            messagebox.showwarning(
+                "Telegram not configured",
+                f"Set Bot Token and Chat ID for '{self.contact_name}'\n"
+                "in the contact edit dialog (⋮ → Edit).",
+                parent=self,
+            )
+            return
+
+        try:
+            cipher = self._enc.encrypt(self.contact_name, text)
+        except Exception as e:
+            self._render_system(f"Encryption failed: {e}")
+            return
+
+        def _do_send():
+            try:
+                tg = TelegramTransport(contact.telegram_bot_token)
+                tg.send(contact.telegram_chat_id, cipher)
+                msg = Message(direction="out", plaintext=text,
+                              ciphertext=cipher, via_telegram=True)
+                self._store.add_message(self.contact_name, msg)
+                # GUI update musi być w głównym wątku
+                self.after(0, lambda: self._on_tg_sent(msg))
+            except Exception as e:
+                self.after(0, lambda err=e: self._render_system(f"Telegram error: {err}"))
+
+        threading.Thread(target=_do_send, daemon=True).start()
+        self.msg_entry.delete(0, "end")
+        self._flash_btn(self._tg_btn, "⏳ Sending...", "#555", "✈ Telegram",
+                        restore_color=COLOR_TG)
+
+    def _on_tg_sent(self, msg: Message):
+        self._render_message(msg)
+        self._flash_btn(self._tg_btn, "✓ Sent!", "#1a6b3c", "✈ Telegram",
+                        restore_color=COLOR_TG)
 
     # ── Odbieranie (deszyfrowanie) ───────────────────────────────
 
-    def _handle_decrypt(self, cipher_text: str):
+    def _handle_decrypt(self, cipher_text: str, via_telegram: bool = False):
         cipher_text = cipher_text.strip()
         if not cipher_text:
             return
         try:
             plaintext = self._enc.decrypt(self.contact_name, cipher_text)
         except Exception as e:
-            self._show_error(f"Deszyfrowanie nie powiodło się:\n{e}")
+            self._render_system(f"Decryption failed: {e}")
             return
 
-        msg = Message(direction="in", plaintext=plaintext, ciphertext=cipher_text)
+        msg = Message(direction="in", plaintext=plaintext,
+                      ciphertext=cipher_text, via_telegram=via_telegram)
         self._store.add_message(self.contact_name, msg)
         self._render_message(msg)
         self._receive_panel.clear()
 
-    # ── Pomocnicze ──────────────────────────────────────────────
+    # ── Telegram polling callback ────────────────────────────────
 
-    def _show_error(self, text: str):
-        tb = self.history._textbox
-        self.history.configure(state="normal")
-        tb.insert("end", f"❌ {text}\n\n", "timestamp")
-        self.history.configure(state="disabled")
-        self.history.see("end")
+    def on_telegram_message(self, cipher_text: str):
+        """Wywoływane z wątku pollingu gdy przyjdzie nowa wiadomość."""
+        self.after(0, lambda: self._handle_decrypt(cipher_text, via_telegram=True))
+
+    # ── Helpers ──────────────────────────────────────────────────
+
+    def _update_tg_button_state(self):
+        try:
+            c = self._enc.get_contact(self.contact_name)
+            configured = bool(c.telegram_bot_token and c.telegram_chat_id)
+        except Exception:
+            configured = False
+        self._tg_btn.configure(
+            state="normal" if configured else "disabled",
+            fg_color=COLOR_TG if configured else "#444",
+        )
+
+    def refresh_tg_state(self):
+        self._update_tg_button_state()
+
+    def _flash_btn(self, btn, temp_text, temp_color, orig_text,
+                   restore_color=None, delay=1800):
+        btn.configure(text=temp_text, fg_color=temp_color)
+        rc = restore_color or ["#3B8ED0", "#1F6AA5"]
+        self.after(delay, lambda: btn.configure(text=orig_text, fg_color=rc))
 
     def clear_history(self):
         self._store.clear_history(self.contact_name)
@@ -315,32 +438,33 @@ class ChatTab(ctk.CTkFrame):
 
 
 # ─────────────────────────────────────────────────────────────────
-# Sidebar z listą kontaktów
+# Sidebar
 # ─────────────────────────────────────────────────────────────────
 class ContactSidebar(ctk.CTkFrame):
     def __init__(self, parent, on_open_cb, on_add_cb, on_edit_cb, on_delete_cb):
         super().__init__(parent, width=220, corner_radius=0)
         self.pack_propagate(False)
-        self._on_open = on_open_cb
-        self._on_add = on_add_cb
-        self._on_edit = on_edit_cb
+        self._on_open   = on_open_cb
+        self._on_add    = on_add_cb
+        self._on_edit   = on_edit_cb
         self._on_delete = on_delete_cb
         self._buttons: dict[str, ctk.CTkButton] = {}
         self._active: str | None = None
         self._build()
 
     def _build(self):
-        ctk.CTkLabel(self, text="Kontakty", font=FONT_TITLE).pack(pady=(16, 8))
+        ctk.CTkLabel(self, text="Contacts", font=FONT_TITLE).pack(pady=(16, 8))
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(side="bottom", fill="x", padx=6, pady=8)
+        ctk.CTkButton(btn_frame, text="+ Add contact",
+                      command=self._on_add).pack(fill="x")
 
         self._list_frame = ctk.CTkScrollableFrame(self, label_text="")
         self._list_frame.pack(fill="both", expand=True, padx=6, pady=4)
 
-        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=6, pady=8)
-        ctk.CTkButton(btn_frame, text="+ Dodaj kontakt", command=self._on_add).pack(fill="x", pady=2)
-
-    def refresh(self, contacts: list[str], active: str | None = None):
-        # usuń stare przyciski
+    def refresh(self, contacts: list[str], tg_status: dict[str, bool],
+                active: str | None = None):
         for w in self._list_frame.winfo_children():
             w.destroy()
         self._buttons.clear()
@@ -349,17 +473,21 @@ class ContactSidebar(ctk.CTkFrame):
             row = ctk.CTkFrame(self._list_frame, fg_color="transparent")
             row.pack(fill="x", pady=1)
 
+            # ikona Telegram jeśli skonfigurowany
+            tg_icon = " ✈" if tg_status.get(name) else ""
+            label = f"{name}{tg_icon}"
+
             btn = ctk.CTkButton(
-                row, text=name, anchor="w",
+                row, text=label, anchor="w",
                 fg_color="#2a5298" if name == active else "transparent",
-                text_color=("white" if name == active else ["gray10", "gray90"]),
+                text_color="white" if name == active else ["gray10", "gray90"],
                 hover_color="#2a5298",
                 command=lambda n=name: self._on_open(n),
             )
             btn.pack(side="left", fill="x", expand=True)
 
-            menu_btn = ctk.CTkButton(row, text="⋮", width=28, fg_color="transparent",
-                                      hover_color="#444",
+            menu_btn = ctk.CTkButton(row, text="⋮", width=28,
+                                      fg_color="transparent", hover_color="#444",
                                       command=lambda n=name: self._show_menu(n))
             menu_btn.pack(side="right")
             self._buttons[name] = btn
@@ -377,54 +505,94 @@ class ContactSidebar(ctk.CTkFrame):
 
     def _show_menu(self, name: str):
         menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="Otwórz rozmowę", command=lambda: self._on_open(name))
-        menu.add_command(label="Edytuj kontakt",  command=lambda: self._on_edit(name))
+        menu.add_command(label="Open chat",    command=lambda: self._on_open(name))
+        menu.add_command(label="Edit contact", command=lambda: self._on_edit(name))
         menu.add_separator()
-        menu.add_command(label="Usuń kontakt",    command=lambda: self._on_delete(name))
+        menu.add_command(label="Delete contact", command=lambda: self._on_delete(name))
         menu.tk_popup(*self.winfo_pointerxy())
 
 
 # ─────────────────────────────────────────────────────────────────
-# Główne okno aplikacji
+# Menadżer pollerów Telegram (jeden per kontakt)
 # ─────────────────────────────────────────────────────────────────
-class SimpleEncryptedChat(ctk.CTk):
+class TelegramPollerManager:
+    """Zarządza wątkami pollingu dla wielu kontaktów jednocześnie."""
+
+    def __init__(self):
+        self._pollers: dict[str, TelegramTransport] = {}
+
+    def start(self, contact_name: str, bot_token: str,
+              on_message_cb) -> None:
+        """Uruchom polling dla kontaktu. Jeśli już działa — zrestartuj."""
+        self.stop(contact_name)
+        tg = TelegramTransport(bot_token)
+        tg.on_message = lambda chat_id, text: on_message_cb(contact_name, chat_id, text)
+        tg.start_polling()
+        self._pollers[contact_name] = tg
+
+    def stop(self, contact_name: str) -> None:
+        if contact_name in self._pollers:
+            self._pollers[contact_name].stop_polling()
+            del self._pollers[contact_name]
+
+    def stop_all(self) -> None:
+        for name in list(self._pollers):
+            self.stop(name)
+
+    def is_running(self, contact_name: str) -> bool:
+        p = self._pollers.get(contact_name)
+        return bool(p and p.is_polling)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Główne okno
+# ─────────────────────────────────────────────────────────────────
+class HushboxApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("🔐 Hushbox - Encrypted Chat")
+        self.title("Hushbox 🔐")
         self.geometry("1200x720")
         self.minsize(900, 580)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self._enc = EncryptionManager(data_dir=DATA_DIR)
-        self._store = ChatStore(data_dir=DATA_DIR)
-        self._tabs: dict[str, ChatTab] = {}     # kontakt → zakładka
+        self._enc    = EncryptionManager(data_dir=DATA_DIR)
+        self._store  = ChatStore(data_dir=DATA_DIR)
+        self._pollers = TelegramPollerManager()
+        self._tabs: dict[str, ChatTab] = {}
 
         self._build_layout()
         self._refresh_contacts()
+        self._start_all_pollers()
 
-    # ── Budowa layoutu ───────────────────────────────────────────
+    # ── Layout ───────────────────────────────────────────────────
 
     def _build_layout(self):
-        # Górny pasek z informacjami
-        top_bar = ctk.CTkFrame(self, height=42, corner_radius=0, fg_color="#1a1a2e")
-        top_bar.pack(fill="x")
-        top_bar.pack_propagate(False)
+        # Topbar
+        top = ctk.CTkFrame(self, height=44, corner_radius=0, fg_color="#1a1a2e")
+        top.pack(fill="x")
+        top.pack_propagate(False)
 
-        ctk.CTkLabel(top_bar, text="🔐 Hushbox - Encrypted Chat",
-                     font=FONT_TITLE, text_color="white").pack(side="left", padx=16)
+        ctk.CTkLabel(top, text="Hushbox 🔐", font=FONT_TITLE,
+                     text_color="white").pack(side="left", padx=16)
 
-        my_key_btn = ctk.CTkButton(top_bar, text="📱 Mój QR", width=100,
-                                    fg_color="#2a5298", command=self._show_qr)
-        my_key_btn.pack(side="right", padx=6, pady=4)
+        ctk.CTkButton(top, text="📱 My QR", width=100,
+                      fg_color="#2a5298",
+                      command=self._show_qr).pack(side="right", padx=6, pady=5)
+        ctk.CTkButton(top, text="📷 Import QR", width=120,
+                      fg_color="#555",
+                      command=self._import_qr).pack(side="right", padx=2, pady=5)
 
-        import_btn = ctk.CTkButton(top_bar, text="📷 Importuj QR", width=130,
-                                    fg_color="#555", command=self._import_qr_key)
-        import_btn.pack(side="right", padx=2, pady=4)
+        # Status bar Telegram (dolny pasek)
+        self._status_var = tk.StringVar(value="")
+        status_bar = ctk.CTkLabel(self, textvariable=self._status_var,
+                                   font=FONT_SMALL, text_color="#888",
+                                   anchor="w")
+        status_bar.pack(fill="x", padx=10, side="bottom")
 
-        # Główna zawartość
+        # Body
         body = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
         body.pack(fill="both", expand=True)
 
-        # Sidebar
         self._sidebar = ContactSidebar(
             body,
             on_open_cb=self._open_chat,
@@ -434,29 +602,34 @@ class SimpleEncryptedChat(ctk.CTk):
         )
         self._sidebar.pack(side="left", fill="y")
 
-        # Obszar zakładek
-        self._tab_area = ctk.CTkFrame(body, fg_color="transparent")
-        self._tab_area.pack(side="left", fill="both", expand=True)
+        tab_area = ctk.CTkFrame(body, fg_color="transparent")
+        tab_area.pack(side="left", fill="both", expand=True)
 
-        self._notebook = ctk.CTkTabview(self._tab_area)
+        self._notebook = ctk.CTkTabview(tab_area)
         self._notebook.pack(fill="both", expand=True, padx=6, pady=6)
 
-        # Strona powitalna (gdy brak otwartych czatów)
-        self._welcome = ctk.CTkFrame(self._tab_area, fg_color="transparent")
+        self._welcome = ctk.CTkFrame(tab_area, fg_color="transparent")
         ctk.CTkLabel(
             self._welcome,
-            text="Wybierz kontakt, aby rozpocząć rozmowę\nlub dodaj nowy za pomocą przycisku '+ Dodaj kontakt'.",
-            font=FONT_LABEL,
-            justify="center",
+            text="Select a contact to start a conversation\nor add a new one with '+ Add contact'.",
+            font=FONT_LABEL, justify="center",
         ).pack(expand=True)
         self._welcome.pack(fill="both", expand=True)
         self._notebook.pack_forget()
 
     # ── Kontakty ─────────────────────────────────────────────────
 
+    def _tg_status(self) -> dict[str, bool]:
+        return {
+            name: bool(self._enc.get_contact(name).telegram_bot_token
+                       and self._enc.get_contact(name).telegram_chat_id)
+            for name in self._enc.list_contacts()
+        }
+
     def _refresh_contacts(self, active: str | None = None):
         contacts = self._enc.list_contacts()
-        self._sidebar.refresh(contacts, active=active or self._current_contact())
+        self._sidebar.refresh(contacts, self._tg_status(),
+                               active=active or self._current_contact())
 
     def _current_contact(self) -> str | None:
         try:
@@ -465,69 +638,73 @@ class SimpleEncryptedChat(ctk.CTk):
             return None
 
     def _add_contact(self):
-        dlg = ContactDialog(self, title="Dodaj kontakt")
+        dlg = ContactDialog(self, title="Add contact")
         self.wait_window(dlg)
         if dlg.result:
-            name, key = dlg.result
+            name, key, tg_token, tg_chat = dlg.result
             try:
-                self._enc.add_contact(name, key)
+                self._enc.add_contact(name, key, tg_token, tg_chat)
                 self._refresh_contacts()
+                self._restart_poller(name)
                 self._open_chat(name)
             except Exception as e:
-                messagebox.showerror("Błąd", str(e), parent=self)
+                messagebox.showerror("Error", str(e), parent=self)
 
     def _edit_contact(self, name: str):
-        dlg = ContactDialog(self, title="Edytuj kontakt",
-                             name=name, key=self._enc.contact_keys.get(name, ""))
+        c = self._enc.get_contact(name)
+        dlg = ContactDialog(self, title="Edit contact",
+                             name=name, key=c.public_key,
+                             tg_token=c.telegram_bot_token,
+                             tg_chat_id=c.telegram_chat_id)
         self.wait_window(dlg)
         if dlg.result:
-            new_name, new_key = dlg.result
+            new_name, new_key, tg_token, tg_chat = dlg.result
             try:
                 if new_name != name:
                     self._enc.rename_contact(name, new_name)
-                    # przesuń historię
-                    self._store.load(name)
-                    old_path = self._store._path(name)
-                    new_path = self._store._path(new_name)
-                    if old_path.exists():
-                        old_path.rename(new_path)
-                    # zamknij starą zakładkę
+                    old_p = self._store._path(name)
+                    new_p = self._store._path(new_name)
+                    if old_p.exists():
+                        old_p.rename(new_p)
+                    self._pollers.stop(name)
                     self._close_tab(name)
                     name = new_name
-                self._enc.add_contact(name, new_key)
+                self._enc.add_contact(name, new_key, tg_token, tg_chat)
                 self._refresh_contacts()
+                self._restart_poller(name)
+                if name in self._tabs:
+                    self._tabs[name].refresh_tg_state()
                 self._open_chat(name)
             except Exception as e:
-                messagebox.showerror("Błąd", str(e), parent=self)
+                messagebox.showerror("Error", str(e), parent=self)
 
     def _delete_contact(self, name: str):
         if not messagebox.askyesno(
-            "Usuń kontakt",
-            f"Czy na pewno chcesz usunąć kontakt '{name}'?\n"
-            "Historia rozmowy zostanie zachowana.",
+            "Delete contact",
+            f"Delete '{name}'?\nChat history will be preserved.",
             parent=self,
         ):
             return
         try:
             self._enc.remove_contact(name)
+            self._pollers.stop(name)
             self._close_tab(name)
             self._refresh_contacts()
         except Exception as e:
-            messagebox.showerror("Błąd", str(e), parent=self)
+            messagebox.showerror("Error", str(e), parent=self)
 
-    # ── Zakładki czatu ────────────────────────────────────────────
+    # ── Zakładki ─────────────────────────────────────────────────
 
     def _open_chat(self, name: str):
-        # Ukryj welcome screen, pokaż notebook
         self._welcome.pack_forget()
         self._notebook.pack(fill="both", expand=True, padx=6, pady=6)
 
         if name not in self._tabs:
             self._notebook.add(name)
-            tab_frame = self._notebook.tab(name)
-            chat_tab = ChatTab(tab_frame, name, self._enc, self._store)
-            chat_tab.pack(fill="both", expand=True)
-            self._tabs[name] = chat_tab
+            frame = self._notebook.tab(name)
+            tab = ChatTab(frame, name, self._enc, self._store, None)
+            tab.pack(fill="both", expand=True)
+            self._tabs[name] = tab
 
         self._notebook.set(name)
         self._sidebar.set_active(name)
@@ -544,55 +721,86 @@ class SimpleEncryptedChat(ctk.CTk):
             self._notebook.pack_forget()
             self._welcome.pack(fill="both", expand=True)
 
+    # ── Telegram polling ─────────────────────────────────────────
+
+    def _start_all_pollers(self):
+        for name in self._enc.list_contacts():
+            self._restart_poller(name)
+
+    def _restart_poller(self, name: str):
+        try:
+            c = self._enc.get_contact(name)
+        except KeyError:
+            return
+        if c.telegram_bot_token:
+            self._pollers.start(name, c.telegram_bot_token, self._on_tg_message)
+            self._set_status(f"Telegram polling active for {len(self._enc.list_contacts())} contact(s)")
+
+    def _on_tg_message(self, contact_name: str, chat_id: str, cipher_text: str):
+        """Callback z wątku pollingu — musi delegować do GUI przez after()."""
+        self.after(0, lambda: self._dispatch_tg_message(contact_name, chat_id, cipher_text))
+
+    def _dispatch_tg_message(self, contact_name: str, chat_id: str, cipher_text: str):
+        # Otwórz zakładkę jeśli nie otwarta
+        if contact_name not in self._tabs:
+            self._open_chat(contact_name)
+        self._tabs[contact_name].on_telegram_message(cipher_text)
+        self._set_status(f"New Telegram message from {contact_name}")
+
+    def _set_status(self, text: str):
+        self._status_var.set(f"  {text}")
+
     # ── QR ───────────────────────────────────────────────────────
 
     def _show_qr(self):
         QRWindow(self, self._enc.export_public_key())
 
-    def _import_qr_key(self):
-        """Import klucza ze schowka (skopiowanego JSON lub surowego base64)."""
-        raw = self.clipboard_get().strip() if self._clipboard_has_text() else ""
+    def _import_qr(self):
+        raw = ""
+        try:
+            raw = self.clipboard_get().strip()
+        except Exception:
+            pass
+
         if not raw:
             messagebox.showinfo(
-                "Import klucza",
-                "Skopiuj do schowka klucz publiczny (base64 lub JSON z QR kodu),\n"
-                "a następnie kliknij ten przycisk ponownie.",
+                "Import key",
+                "Copy a public key (base64 or JSON from QR) to clipboard,\n"
+                "then click this button again.",
                 parent=self,
             )
             return
 
-        # Próbuj JSON
-        public_key = None
+        public_key = raw
         try:
             data = json.loads(raw)
-            public_key = data.get("public_key", "")
+            public_key = data.get("public_key", raw)
         except Exception:
-            public_key = raw  # traktuj jako surowy base64
+            pass
 
-        dlg = ContactDialog(self, title="Dodaj kontakt z QR", key=public_key)
+        dlg = ContactDialog(self, title="Add contact from QR", key=public_key)
         self.wait_window(dlg)
         if dlg.result:
-            name, key = dlg.result
+            name, key, tg_token, tg_chat = dlg.result
             try:
-                self._enc.add_contact(name, key)
+                self._enc.add_contact(name, key, tg_token, tg_chat)
                 self._refresh_contacts()
+                self._restart_poller(name)
                 self._open_chat(name)
             except Exception as e:
-                messagebox.showerror("Błąd", str(e), parent=self)
+                messagebox.showerror("Error", str(e), parent=self)
 
-    def _clipboard_has_text(self) -> bool:
-        try:
-            self.clipboard_get()
-            return True
-        except Exception:
-            return False
+    # ── Zamknięcie ───────────────────────────────────────────────
+
+    def _on_close(self):
+        self._pollers.stop_all()
+        self.destroy()
 
 
 # ─────────────────────────────────────────────────────────────────
-# Uruchomienie
+# Start
 # ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
-    app = SimpleEncryptedChat()
-    app.mainloop()
+    HushboxApp().mainloop()

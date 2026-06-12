@@ -6,7 +6,7 @@ Hushbox is a local desktop application for end-to-end encrypted messaging, built
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Tests](https://img.shields.io/badge/Tests-39%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-59%20passed-brightgreen)
 
 ---
 
@@ -27,6 +27,7 @@ No server. No accounts. No metadata. The encrypted blob is meaningless to anyone
 - **Multi-contact sidebar** — open multiple conversations as tabs simultaneously
 - **QR code key exchange** — share your public key as a scannable QR
 - **Auto-copy to clipboard** — encrypted text is ready to paste after every send
+- **Telegram integration** — send & receive encrypted messages directly via your own Telegram bot
 - **Persistent chat history** — conversations are saved locally per contact
 - **Contact management** — add, rename, delete contacts with their public keys
 - **Dark mode UI** built with [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter)
@@ -127,6 +128,39 @@ pytest tests/ -v
 | Authentication | Each message is authenticated (MAC) — tampering is detected |
 
 > **Keep `my_private_key.bin` safe.** If you lose it, you cannot decrypt old messages. If someone obtains it, they can decrypt all your messages.
+
+---
+
+## Telegram integration
+
+Hushbox can deliver encrypted messages automatically via Telegram — no manual copy-paste needed.
+Each user runs their own bot, so no third party has access to the token or messages.
+
+### Setup (one-time, per contact)
+
+1. Open Telegram and message [@BotFather](https://t.me/BotFather)
+2. Send `/newbot`, follow the prompts → copy the **Bot Token**
+3. In Hushbox, open a contact's edit dialog (**⋮ → Edit**)
+4. Paste your **Bot Token** and the contact's **Chat ID**
+   - To get the Chat ID: ask your contact to send `/start` to your bot — Hushbox reads it automatically
+5. Save — the **✈ Telegram** button activates in that conversation
+
+### How it works
+
+```
+[Alice]  types message
+   ↓  Hushbox encrypts (NaCl)
+   ↓  sends ciphertext via Alice's bot → Telegram servers → Bob's phone
+[Bob]    Hushbox polls his bot → receives ciphertext → decrypts automatically
+```
+
+Telegram sees only the encrypted blob. The `✈` badge in chat history marks messages sent/received via Telegram.
+
+### requirements
+
+```bash
+pip install python-telegram-bot==22.*
+```
 
 ---
 
