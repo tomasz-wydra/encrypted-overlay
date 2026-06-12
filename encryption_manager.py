@@ -1,11 +1,41 @@
 """
 EncryptionManager - obsługuje klucze NaCl i szyfrowanie/deszyfrowanie wiadomości.
+
+contact_keys.json przechowuje teraz pełne dane kontaktu:
+{
+  "Jan Kowalski": {
+    "public_key": "base64...",
+    "telegram_chat_id": "123456789",
+    "telegram_bot_token": "123:ABC..."
+  }
+}
 """
 from nacl.public import PrivateKey, PublicKey, Box
 from nacl.encoding import Base64Encoder
 import json
-import os
 from pathlib import Path
+from dataclasses import dataclass, field, asdict
+
+
+@dataclass
+class ContactInfo:
+    public_key: str
+    telegram_chat_id: str = ""        # chat_id odbiorcy (jego Telegram ID)
+    telegram_bot_token: str = ""      # token własnego bota (z BotFather)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ContactInfo":
+        # obsługa starego formatu (plain string zamiast dict)
+        if isinstance(d, str):
+            return cls(public_key=d)
+        return cls(
+            public_key=d.get("public_key", ""),
+            telegram_chat_id=d.get("telegram_chat_id", ""),
+            telegram_bot_token=d.get("telegram_bot_token", ""),
+        )
 
 
 class EncryptionManager:
@@ -18,14 +48,18 @@ class EncryptionManager:
 
         self.private_key = self._load_or_generate_private_key()
         self.public_key = self.private_key.public_key
-        self.contact_keys: dict[str, str] = self._load_contact_keys()
+        self.contacts: dict[str, ContactInfo] = self._load_contacts()
+
+        # zachowana kompatybilność wsteczna — słownik name→public_key_b64
+        self.contact_keys: dict[str, str] = {
+            n: c.public_key for n, c in self.contacts.items()
+        }
 
     # ------------------------------------------------------------------
     # Klucze własne
     # ------------------------------------------------------------------
 
     def _load_or_generate_private_key(self) -> PrivateKey:
-        """Załaduj klucz prywatny z pliku lub wygeneruj nowy."""
         if self.private_key_path.exists():
             with open(self.private_key_path, "rb") as f:
                 return PrivateKey(f.read())
@@ -35,80 +69,96 @@ class EncryptionManager:
         return key
 
     def export_public_key(self) -> str:
-        """Zwróć własny klucz publiczny jako base64 string."""
         return self.public_key.encode(encoder=Base64Encoder).decode()
 
     # ------------------------------------------------------------------
     # Kontakty
     # ------------------------------------------------------------------
 
-    def _load_contact_keys(self) -> dict[str, str]:
-        """Załaduj klucze kontaktów z pliku JSON."""
+    def _load_contacts(self) -> dict[str, "ContactInfo"]:
         if self.contact_keys_path.exists():
             with open(self.contact_keys_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                raw = json.load(f)
+            return {name: ContactInfo.from_dict(val) for name, val in raw.items()}
         return {}
 
-    def _save_contact_keys(self) -> None:
-        """Zapisz kontakty do pliku JSON."""
+    def _save_contacts(self) -> None:
+        data = {name: c.to_dict() for name, c in self.contacts.items()}
         with open(self.contact_keys_path, "w", encoding="utf-8") as f:
-            json.dump(self.contact_keys, f, indent=2, ensure_ascii=False)
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        # sync kompatybilny słownik
+        self.contact_keys = {n: c.public_key for n, c in self.contacts.items()}
 
-    def add_contact(self, name: str, public_key_b64: str) -> None:
+    def add_contact(self, name: str, public_key_b64: str,
+                    telegram_chat_id: str = "",
+                    telegram_bot_token: str = "") -> None:
         """Dodaj lub zaktualizuj kontakt."""
         name = name.strip()
         if not name:
             raise ValueError("Nazwa kontaktu nie może być pusta.")
-        # walidacja klucza
-        PublicKey(public_key_b64.encode(), encoder=Base64Encoder)
-        self.contact_keys[name] = public_key_b64
-        self._save_contact_keys()
+        PublicKey(public_key_b64.encode(), encoder=Base64Encoder)  # walidacja
+        # zachowaj istniejące dane Telegram jeśli nie podano nowych
+        existing = self.contacts.get(name)
+        self.contacts[name] = ContactInfo(
+            public_key=public_key_b64,
+            telegram_chat_id=telegram_chat_id or (existing.telegram_chat_id if existing else ""),
+            telegram_bot_token=telegram_bot_token or (existing.telegram_bot_token if existing else ""),
+        )
+        self._save_contacts()
+
+    def update_telegram(self, name: str, chat_id: str, bot_token: str) -> None:
+        """Zaktualizuj dane Telegram dla istniejącego kontaktu."""
+        if name not in self.contacts:
+            raise KeyError(f"Kontakt '{name}' nie istnieje.")
+        self.contacts[name].telegram_chat_id = chat_id.strip()
+        self.contacts[name].telegram_bot_token = bot_token.strip()
+        self._save_contacts()
+
+    def get_contact(self, name: str) -> ContactInfo:
+        if name not in self.contacts:
+            raise KeyError(f"Kontakt '{name}' nie istnieje.")
+        return self.contacts[name]
 
     def remove_contact(self, name: str) -> None:
-        """Usuń kontakt."""
-        if name not in self.contact_keys:
+        if name not in self.contacts:
             raise KeyError(f"Kontakt '{name}' nie istnieje.")
-        del self.contact_keys[name]
-        self._save_contact_keys()
+        del self.contacts[name]
+        self._save_contacts()
 
     def rename_contact(self, old_name: str, new_name: str) -> None:
-        """Zmień nazwę kontaktu."""
         new_name = new_name.strip()
-        if old_name not in self.contact_keys:
+        if old_name not in self.contacts:
             raise KeyError(f"Kontakt '{old_name}' nie istnieje.")
         if not new_name:
             raise ValueError("Nowa nazwa nie może być pusta.")
-        self.contact_keys[new_name] = self.contact_keys.pop(old_name)
-        self._save_contact_keys()
+        self.contacts[new_name] = self.contacts.pop(old_name)
+        self._save_contacts()
 
     def list_contacts(self) -> list[str]:
-        """Zwróć posortowaną listę nazw kontaktów."""
-        return sorted(self.contact_keys.keys())
+        return sorted(self.contacts.keys())
 
     def has_contact(self, name: str) -> bool:
-        return name in self.contact_keys
+        return name in self.contacts
 
     # ------------------------------------------------------------------
     # Szyfrowanie / Deszyfrowanie
     # ------------------------------------------------------------------
 
     def _get_box(self, contact_name: str) -> Box:
-        if contact_name not in self.contact_keys:
+        if contact_name not in self.contacts:
             raise KeyError(f"Brak klucza publicznego dla kontaktu '{contact_name}'.")
         recipient_key = PublicKey(
-            self.contact_keys[contact_name].encode(),
+            self.contacts[contact_name].public_key.encode(),
             encoder=Base64Encoder,
         )
         return Box(self.private_key, recipient_key)
 
     def encrypt(self, contact_name: str, plaintext: str) -> str:
-        """Zaszyfruj wiadomość dla kontaktu, zwróć base64 string."""
         box = self._get_box(contact_name)
         encrypted = box.encrypt(plaintext.encode("utf-8"), encoder=Base64Encoder)
         return encrypted.decode()
 
     def decrypt(self, contact_name: str, ciphertext: str) -> str:
-        """Odszyfruj wiadomość od kontaktu, zwróć plaintext."""
         box = self._get_box(contact_name)
         decrypted = box.decrypt(ciphertext.strip().encode(), encoder=Base64Encoder)
         return decrypted.decode("utf-8")
